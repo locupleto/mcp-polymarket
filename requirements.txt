@@ -1,2 +1,2 @@
 mcp>=1.23.1
-polymarket-apis>=0.4.3
+polymarket-apis>=0.5.4
