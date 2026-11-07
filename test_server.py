@@ -153,6 +153,15 @@ async def test_get_price_history():
     return len(trades) > 0
 
 
+async def test_malformed_offset_dates():
+    """Gamma's '+00:00:00' offsets (umaEndDate) must not fail model validation."""
+    print("\n=== Testing malformed offset dates ===")
+    from polymarket_apis.types.gamma_types import GammaMarket
+    m = GammaMarket.model_validate({"id": "1", "umaEndDate": "2026-11-07 22:28:54.381407+00:00:00"})
+    print(f"Parsed umaEndDate: {m.uma_end_date}")
+    return m.uma_end_date is not None and m.uma_end_date.utcoffset().total_seconds() == 0
+
+
 async def run_all_tests():
     """Run all tests."""
     print("=" * 60)
@@ -160,6 +169,7 @@ async def run_all_tests():
     print("=" * 60)
 
     tests = [
+        ("malformed_offset_dates", test_malformed_offset_dates),
         ("search_markets", test_search_markets),
         ("get_trending_markets", test_get_trending_markets),
         ("get_market_details", test_get_market_details),

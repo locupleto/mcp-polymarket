@@ -15,13 +15,63 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, CallToolResult, ListToolsResult
 
+import re
+from dateutil import parser as _dateutil_parser
+
 from polymarket_apis import PolymarketGammaClient, PolymarketDataClient
+from polymarket_apis.types import common as _pm_common
 from polymarket_apis.types.gamma_types import Event, GammaMarket
+
+
+# Gamma sometimes sends timestamps with a malformed UTC offset that has a seconds
+# part, e.g. umaEndDate '2026-11-07 22:28:54.381407+00:00:00'. dateutil rejects it,
+# and one bad field fails validation of the whole search/event response.
+# polymarket-apis (<= 2.3.0) parses via the module-level name `parser` at call time,
+# so swapping that name for a normalising shim fixes every FlexibleDatetime field.
+_OFFSET_WITH_SECONDS = re.compile(r"([+-]\d{2}:\d{2}):\d{2}$")
+
+
+class _LenientDateParser:
+    @staticmethod
+    def parse(value, *args, **kwargs):
+        if isinstance(value, str):
+            value = _OFFSET_WITH_SECONDS.sub(r"\1", value.strip())
+        return _dateutil_parser.parse(value, *args, **kwargs)
+
+
+_pm_common.parser = _LenientDateParser()
 
 
 # Initialize Polymarket clients (no auth needed for read operations)
 gamma_client = PolymarketGammaClient()
 data_client = PolymarketDataClient()
+
+
+DATA_API_V2 = "https://data-api.polymarket.com/v2"
+
+
+def get_trades_v2(condition_id: str, limit: int = 50) -> list[dict]:
+    """Most recent trades of a market, newest first.
+
+    Polymarket retired Data API v1 (410 Gone), which polymarket-apis (<= 2.3.0)
+    still calls. v2 filters by `condition` and wraps rows as {data, pagination};
+    pages of at most 500 are followed via `next_cursor`.
+    """
+    trades: list[dict] = []
+    cursor = None
+    while len(trades) < limit:
+        params = {"condition": condition_id, "limit": min(500, limit - len(trades))}
+        if cursor:
+            params["cursor"] = cursor
+        response = data_client.client.get(f"{DATA_API_V2}/trades", params=params)
+        response.raise_for_status()
+        body = response.json()
+        trades += body.get("data", [])
+        page = body.get("pagination") or {}
+        cursor = page.get("next_cursor")
+        if not page.get("has_more") or not cursor:
+            break
+    return trades[:limit]
 
 
 def format_price_as_probability(price: float) -> str:
@@ -504,24 +554,23 @@ async def execute_tool(name: str, arguments: dict) -> Any:
         condition_id = arguments["condition_id"]
         limit = arguments.get("limit", 50)
 
-        trades = data_client.get_trades(
-            limit=limit,
-            condition_id=condition_id
-        )
+        trades = get_trades_v2(condition_id, limit)
 
         trade_history = []
         for trade in trades:
+            ts = trade.get("timestamp")
+            price = trade.get("price")
             trade_history.append({
-                "timestamp": trade.timestamp.isoformat() if trade.timestamp else None,
-                "price": trade.price,
-                "probability": format_price_as_probability(trade.price) if trade.price else None,
-                "size": trade.size,
-                "side": trade.side,
-                "outcome": trade.outcome,
+                "timestamp": datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else None,
+                "price": price,
+                "probability": format_price_as_probability(price) if price else None,
+                "size": trade.get("size"),
+                "side": trade.get("side"),
+                "outcome": trade.get("outcome"),
             })
 
         # Calculate price stats
-        prices = [t.price for t in trades if t.price is not None]
+        prices = [t["price"] for t in trades if t.get("price") is not None]
         stats = {}
         if prices:
             stats = {
